@@ -178,7 +178,7 @@ def visualize_pointcloud(points, normals=None,
     plt.close(fig)
 
 
-def visualize_pointcloud_batch(path, pointclouds, pred_labels, labels, categories, vis_label=False, target=None,  elev=30, azim=225):
+def visualize_pointcloud_batch(path, pointclouds, pred_labels, labels, categories, rand_col = False, vis_label=False, target=None,  elev=30, azim=225):
     batch_size = len(pointclouds)
     fig = plt.figure(figsize=(20,20))
 
@@ -196,6 +196,12 @@ def visualize_pointcloud_batch(path, pointclouds, pred_labels, labels, categorie
             colour = target[idx]
         pc = pc.cpu().numpy()
         ax = fig.add_subplot(nrows, ncols, idx + 1, projection='3d')
+
+        random_color = np.random.rand(len(pc), 3)
+
+        if rand_col:
+            colour = random_color
+
         ax.scatter(pc[:, 0], pc[:, 2], pc[:, 1], c=colour, s=5)
         ax.view_init(elev=elev, azim=azim)
         ax.axis('off')

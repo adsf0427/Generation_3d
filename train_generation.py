@@ -9,6 +9,7 @@ from torch.distributions import Normal
 from utils.file_utils import *
 from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
+from model.transformer_generation import PointDiffusionTransformer
 import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
 
@@ -463,6 +464,72 @@ class Model(nn.Module):
     def multi_gpu_wrapper(self, f):
         self.model = f(self.model)
 
+class ModelTransformer(nn.Module):
+    def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type:str):
+        super(ModelTransformer, self).__init__()
+        self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = PointDiffusionTransformer(device=device, dtype=torch.float32)
+
+    def prior_kl(self, x0):
+        return self.diffusion._prior_bpd(x0)
+
+    def all_kl(self, x0, clip_denoised=True):
+        total_bpd_b, vals_bt, prior_bpd_b, mse_bt =  self.diffusion.calc_bpd_loop(self._denoise, x0, clip_denoised)
+
+        return {
+            'total_bpd_b': total_bpd_b,
+            'terms_bpd': vals_bt,
+            'prior_bpd_b': prior_bpd_b,
+            'mse_bt':mse_bt
+        }
+
+
+    def _denoise(self, data, t):
+        B, D,N= data.shape
+        assert data.dtype == torch.float
+        assert t.shape == torch.Size([B]) and t.dtype == torch.int64
+
+        out = self.model(data, t)
+
+        assert out.shape == torch.Size([B, D, N])
+        return out
+
+    def get_loss_iter(self, data, noises=None):
+        B, D, N = data.shape
+        t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.device)
+
+        if noises is not None:
+            noises[t!=0] = torch.randn((t!=0).sum(), *noises.shape[1:]).to(noises)
+
+        losses = self.diffusion.p_losses(
+            denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
+        assert losses.shape == t.shape == torch.Size([B])
+        return losses
+
+    def gen_samples(self, shape, device, noise_fn=torch.randn,
+                    clip_denoised=True,
+                    keep_running=False):
+        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
+                                            clip_denoised=clip_denoised,
+                                            keep_running=keep_running)
+
+    def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
+                    clip_denoised=True,keep_running=False):
+        return self.diffusion.p_sample_loop_trajectory(self._denoise, shape=shape, device=device, noise_fn=noise_fn, freq=freq,
+                                                       clip_denoised=clip_denoised,
+                                                       keep_running=keep_running)
+
+    def train(self):
+        self.model.train()
+
+    def eval(self):
+        self.model.eval()
+
+    def multi_gpu_wrapper(self, f):
+        self.model = f(self.model)
+
 
 def get_betas(schedule_type, b_start, b_end, time_num):
     if schedule_type == 'linear':
@@ -579,7 +646,8 @@ def train(gpu, opt, output_dir, noises_init):
     '''
 
     betas = get_betas(opt.schedule_type, opt.beta_start, opt.beta_end, opt.time_num)
-    model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
+    # model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
+    model = ModelTransformer(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
 
     if opt.distribution_type == 'multi':  # Multiple processes, single GPU per process
         def _transform_(m):
@@ -659,6 +727,7 @@ def train(gpu, opt, output_dir, noises_init):
 
 
             if i % opt.print_freq == 0 and should_diag:
+                # print(x.shape, noises_batch.shape)
 
                 logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    loss: {:>10.4f},    '
                              'netpNorm: {:>10.2f},   netgradNorm: {:>10.2f}     '
@@ -689,7 +758,7 @@ def train(gpu, opt, output_dir, noises_init):
 
 
 
-        if (epoch + 1) % opt.vizIter == 0 and should_diag:
+        if (epoch) % opt.vizIter == 0 and should_diag:
             logger.info('Generation: eval')
 
             model.eval()
@@ -722,6 +791,17 @@ def train(gpu, opt, output_dir, noises_init):
             visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x.transpose(1, 2), None,
                                        None,
                                        None)
+            
+            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_all_color.png' % (outf_syn, epoch),
+                                       x_gen_all.transpose(1, 2), None,
+                                       None,
+                                       None,
+                                       rand_col=True)
+            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_color.png' % (outf_syn, epoch),
+                                       x_gen_eval.transpose(1, 2), None,
+                                       None,
+                                       None,
+                                       rand_col=True)
 
             logger.info('Generation: train')
             model.train()

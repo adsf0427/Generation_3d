@@ -8,3 +8,7 @@ __pycache__
 *.npz
 eval_model
 eval_data
+shapenetcore_partanno_segmentation_benchmark_v0
+shapenetcore_partanno_segmentation_benchmark_v0_normal
+slurm_log
+*.zip

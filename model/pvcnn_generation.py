@@ -223,7 +223,7 @@ class PVCNN2Base(nn.Module):
         return emb
 
     def forward(self, inputs, t):
-
+        # print("inputs: ",inputs.shape)
         temb =  self.embedf(self.get_timestep_embedding(t, inputs.device))[:,:,None].expand(-1,-1,inputs.shape[-1])
 
         # inputs : [B, in_channels + S, N]
@@ -242,6 +242,9 @@ class PVCNN2Base(nn.Module):
         for fp_idx, fp_blocks  in enumerate(self.fp_layers):
             features, coords, temb = fp_blocks((coords_list[-1-fp_idx], coords, torch.cat([features,temb],dim=1), in_features_list[-1-fp_idx], temb))
 
-        return self.classifier(features)
+        # print("feature:", features.shape)
+        out = self.classifier(features)
+        # print("out: ", out.shape)
+        return out
 
 
