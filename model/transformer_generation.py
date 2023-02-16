@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from .checkpoint import checkpoint
-# from .pretrained_clip import FrozenImageCLIP, ImageCLIP, ImageType
+from .pretrained_clip import FrozenImageCLIP, ImageCLIP, ImageType
 from .util import timestep_embedding
 
 
@@ -192,7 +192,7 @@ class PointDiffusionTransformer(nn.Module):
             self.output_proj.weight.zero_()
             self.output_proj.bias.zero_()
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor):
+    def forward(self, x: torch.Tensor, t: torch.Tensor, texts: Optional[Iterable[Optional[str]]] = None):
         """
         :param x: an [N x C x T] tensor.
         :param t: an [N] tensor.
@@ -256,9 +256,7 @@ class CLIPImagePointDiffusionTransformer(PointDiffusionTransformer):
         self,
         x: torch.Tensor,
         t: torch.Tensor,
-        images: Optional[Iterable[Optional[ImageType]]] = None,
         texts: Optional[Iterable[Optional[str]]] = None,
-        embeddings: Optional[Iterable[Optional[torch.Tensor]]] = None,
     ):
         """
         :param x: an [N x C x T] tensor.
@@ -271,7 +269,7 @@ class CLIPImagePointDiffusionTransformer(PointDiffusionTransformer):
         assert x.shape[-1] == self.n_ctx
 
         t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
-        clip_out = self.clip(batch_size=len(x), images=images, texts=texts, embeddings=embeddings)
+        clip_out = self.clip(batch_size=len(x), images=None, texts=texts, embeddings=None)
         assert len(clip_out.shape) == 2 and clip_out.shape[0] == x.shape[0]
 
         if self.training:

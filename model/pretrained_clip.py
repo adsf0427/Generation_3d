@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from .download import default_cache_dir
+# from .download import default_cache_dir
 
 ImageType = Union[np.ndarray, torch.Tensor, Image.Image]
 

@@ -3,7 +3,7 @@ salloc --nodes=1 --time=2:0:0 --ntasks=1 --account=def-rjliao --gres=gpu:a100:1 
 module load python/3.8 cuda/11.4
 module load cuda/11.4
 source ~/zsx/bin/activate 
-python train_generation.py --category chair --model output/pretrained/chair_1799.pth
+python train_generation.py --category all --uncondition False
 
 export NCCL_BLOCKING_WAIT=1
 

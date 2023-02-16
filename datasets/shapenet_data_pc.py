@@ -194,6 +194,8 @@ class Uniform15KPC(Dataset):
             # out['train_masks'] = tr_mask
             tr_mask = self.mask_transform(tr_out)
             out['train_masks'] = tr_mask
+        
+        out['text'] = synsetid_to_cate[out['sid']]
 
         return out
 
