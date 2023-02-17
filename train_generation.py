@@ -211,9 +211,9 @@ class GaussianDiffusion:
                 x_start.shape[0])
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool):
+    def p_mean_variance(self, denoise_fn, data, t, texts, clip_denoised: bool, return_pred_xstart: bool):
 
-        model_output = denoise_fn(data, t)
+        model_output = denoise_fn(data, t, texts)
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
             # below: only log_variance is used in the KL computations
@@ -259,11 +259,11 @@ class GaussianDiffusion:
 
     ''' samples '''
 
-    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False):
+    def p_sample(self, denoise_fn, data, t, texts, noise_fn, clip_denoised=False, return_pred_xstart=False):
         """
         Sample from the model
         """
-        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
+        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, texts=texts, clip_denoised=clip_denoised,
                                                                               return_pred_xstart=True)
         noise = noise_fn(size=data.shape, dtype=data.dtype, device=data.device)
         assert noise.shape == data.shape
@@ -286,10 +286,11 @@ class GaussianDiffusion:
 
         assert isinstance(shape, (tuple, list))
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        texts = ['car' for _ in range(shape[0])]
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64,
                              device=device).fill_(t)
-            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
+            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, texts=texts, noise_fn=noise_fn,
                                   clip_denoised=clip_denoised, return_pred_xstart=False)
 
         assert img_t.shape == shape
@@ -311,11 +312,12 @@ class GaussianDiffusion:
 
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
         imgs = [img_t]
+        texts = ['car' for _ in range(shape[0])]
         for t in reversed(range(0, total_steps)):
 
             t_ = torch.empty(shape[0], dtype=torch.int64,
                              device=device).fill_(t)
-            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
+            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, texts=texts, noise_fn=noise_fn,
                                   clip_denoised=clip_denoised,
                                   return_pred_xstart=False)
             if t % freq == 0 or t == total_steps-1:
@@ -710,7 +712,7 @@ def train(gpu, opt, output_dir, noises_init):
     # model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
     if opt.use_transformer:
         model = ModelTransformer(opt, betas, opt.loss_type,
-                             opt.model_mean_type, opt.model_var_type, uncondition=opt.unconditioned)
+                             opt.model_mean_type, opt.model_var_type, uncondition=opt.uncondition)
     else:
         model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
 
@@ -983,10 +985,10 @@ def parse_args():
                         help='GPU id to use. None means using all available GPUs.')
 
     '''eval'''
-    parser.add_argument('--saveIter', default=100, help='unit: epoch')
-    parser.add_argument('--diagIter', default=50, help='unit: epoch')
-    parser.add_argument('--vizIter', default=50, help='unit: epoch')
-    parser.add_argument('--print_freq', default=50, help='unit: iter')
+    parser.add_argument('--saveIter', default=20, help='unit: epoch')
+    parser.add_argument('--diagIter', default=20, help='unit: epoch')
+    parser.add_argument('--vizIter', default=20, help='unit: epoch')
+    parser.add_argument('--print_freq', default=20, help='unit: iter')
 
     parser.add_argument('--manualSeed', default=42,
                         type=int, help='random seed')
