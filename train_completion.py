@@ -804,7 +804,7 @@ def parse_args():
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,
                         help='Number of distributed nodes.')
-    parser.add_argument('--dist_url', default='tcp://127.0.0.1:9991', type=str,
+    parser.add_argument('--dist_url', default='tcp://127.0.0.1:19991', type=str,
                         help='url used to set up distributed training')
     parser.add_argument('--dist_backend', default='nccl', type=str,
                         help='distributed backend')
