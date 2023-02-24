@@ -8,7 +8,6 @@ from torch.distributions import Normal
 
 from utils.file_utils import *
 from utils.visualize import *
-from model.pvcnn_generation import PVCNN2Base
 from model.transformer_generation import PointDiffusionTransformer, CLIPImagePointDiffusionTransformer
 import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
@@ -110,7 +109,9 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
 
 
 class GaussianDiffusion:
-    def __init__(self, betas, loss_type, model_mean_type, model_var_type):
+    def __init__(self, betas, loss_type, model_mean_type, model_var_type,
+                 parameterization="eps", clip_model=None):
+        self.parameterization = parameterization
         self.loss_type = loss_type
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -231,8 +232,11 @@ class GaussianDiffusion:
             raise NotImplementedError(self.model_var_type)
 
         if self.model_mean_type == 'eps':
-            x_recon = self._predict_xstart_from_eps(
-                data, t=t, eps=model_output)
+            if self.parameterization == "eps":
+                x_recon = self._predict_xstart_from_eps(
+                    data, t=t, eps=model_output)
+            elif self.parameterization == "x0":
+                x_recon = model_output
 
             if clip_denoised:
                 x_recon = torch.clamp(x_recon, -.5, .5)
@@ -346,6 +350,10 @@ class GaussianDiffusion:
         """
         B, D, N = data_start.shape
         assert t.shape == torch.Size([B])
+        if self.parameterization == "eps":
+            target = noise
+        elif self.parameterization == "x0":
+            target = data_start
 
         if noise is None:
             noise = torch.randn(
@@ -356,12 +364,17 @@ class GaussianDiffusion:
 
         if self.loss_type == 'mse':
             # predict the noise instead of x_start. seems to be weighted naturally like SNR
-            eps_recon = denoise_fn(data_t, t,  texts=texts)
+            model_out = denoise_fn(data_t, t,  texts=texts)
             assert data_t.shape == data_start.shape
-            assert eps_recon.shape == torch.Size([B, D, N])
-            assert eps_recon.shape == data_start.shape
-            losses = ((noise - eps_recon) **
+            assert model_out.shape == torch.Size([B, D, N])
+            assert model_out.shape == data_start.shape
+            losses = ((target - model_out) **
                       2).mean(dim=list(range(1, len(data_start.shape))))
+            if self.clip_loss:
+                assert self.parameterization == "x0"
+                
+
+
         elif self.loss_type == 'kl':
             losses = self._vb_terms_bpd(
                 denoise_fn=denoise_fn, data_start=data_start, data_t=data_t, t=t, clip_denoised=False,
@@ -422,98 +435,6 @@ class GaussianDiffusion:
             return total_bpd_b.mean(), vals_bt_.mean(), prior_bpd_b.mean(), mse_bt_.mean()
 
 
-class PVCNN2(PVCNN2Base):
-    sa_blocks = [
-        ((32, 2, 32), (1024, 0.1, 32, (32, 64))),
-        ((64, 3, 16), (256, 0.2, 32, (64, 128))),
-        ((128, 3, 8), (64, 0.4, 32, (128, 256))),
-        (None, (16, 0.8, 32, (256, 256, 512))),
-    ]
-    fp_blocks = [
-        ((256, 256), (256, 3, 8)),
-        ((256, 256), (256, 3, 8)),
-        ((256, 128), (128, 2, 16)),
-        ((128, 128, 64), (64, 2, 32)),
-    ]
-
-    def __init__(self, num_classes, embed_dim, use_att, dropout, extra_feature_channels=3, width_multiplier=1,
-                 voxel_resolution_multiplier=1):
-        super().__init__(
-            num_classes=num_classes, embed_dim=embed_dim, use_att=use_att,
-            dropout=dropout, extra_feature_channels=extra_feature_channels,
-            width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
-        )
-
-
-class Model(nn.Module):
-    def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type: str):
-        super(Model, self).__init__()
-        self.diffusion = GaussianDiffusion(
-            betas, loss_type, model_mean_type, model_var_type)
-
-        self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
-                            dropout=args.dropout, extra_feature_channels=0)
-
-    def prior_kl(self, x0):
-        return self.diffusion._prior_bpd(x0)
-
-    def all_kl(self, x0, clip_denoised=True):
-        total_bpd_b, vals_bt, prior_bpd_b, mse_bt = self.diffusion.calc_bpd_loop(
-            self._denoise, x0, clip_denoised)
-
-        return {
-            'total_bpd_b': total_bpd_b,
-            'terms_bpd': vals_bt,
-            'prior_bpd_b': prior_bpd_b,
-            'mse_bt': mse_bt
-        }
-
-    def _denoise(self, data, t):
-        B, D, N = data.shape
-        assert data.dtype == torch.float
-        assert t.shape == torch.Size([B]) and t.dtype == torch.int64
-
-        out = self.model(data, t)
-
-        assert out.shape == torch.Size([B, D, N])
-        return out
-
-    def get_loss_iter(self, data, noises=None):
-        B, D, N = data.shape
-        t = torch.randint(0, self.diffusion.num_timesteps,
-                          size=(B,), device=data.device)
-
-        if noises is not None:
-            noises[t != 0] = torch.randn(
-                (t != 0).sum(), *noises.shape[1:]).to(noises)
-
-        losses = self.diffusion.p_losses(
-            denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
-        assert losses.shape == t.shape == torch.Size([B])
-        return losses
-
-    def gen_samples(self, shape, device, noise_fn=torch.randn,
-                    clip_denoised=True,
-                    keep_running=False):
-        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
-                                            clip_denoised=clip_denoised,
-                                            keep_running=keep_running)
-
-    def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
-                        clip_denoised=True, keep_running=False):
-        return self.diffusion.p_sample_loop_trajectory(self._denoise, shape=shape, device=device, noise_fn=noise_fn, freq=freq,
-                                                       clip_denoised=clip_denoised,
-                                                       keep_running=keep_running)
-
-    def train(self):
-        self.model.train()
-
-    def eval(self):
-        self.model.eval()
-
-    def multi_gpu_wrapper(self, f):
-        self.model = f(self.model)
-
 
 class ModelTransformer(nn.Module):
     def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type: str, uncondition: bool = True):
@@ -556,7 +477,7 @@ class ModelTransformer(nn.Module):
         assert out.shape == torch.Size([B, D, N])
         return out
 
-    def get_loss_iter(self, data, noises=None, texts = None):
+    def get_loss_iter(self, data, noises=None, texts = None, clip_loss=False):
         B, D, N = data.shape
         t = torch.randint(0, self.diffusion.num_timesteps,
                           size=(B,), device=data.device)
@@ -782,7 +703,14 @@ def train(gpu, opt, output_dir, noises_init):
                 x = x.cuda()
                 noises_batch = noises_batch.cuda()
 
-            loss = model.get_loss_iter(x, noises_batch, texts = texts).mean()
+            diff_loss, clip_loss = model.get_loss_iter(x, noises_batch, texts = texts)
+            diff_loss = diff_loss.mean()
+
+            if clip_loss:
+                clip_loss = clip_loss.mean()
+                loss = diff_loss + clip_loss
+            else :
+                loss = diff_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -796,11 +724,11 @@ def train(gpu, opt, output_dir, noises_init):
             if i % opt.print_freq == 0 and should_diag:
                 # print(x.shape, noises_batch.shape)
 
-                logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    loss: {:>10.4f},    '
+                logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    diff_loss: {:>10.4f},    clip_loss: {:>10.4f},'
                             'netpNorm: {:>10.2f},   netgradNorm: {:>10.2f}     '
                             .format(
                                 epoch, opt.niter, i, len(
-                                    dataloader), loss.item(),
+                                    dataloader), diff_loss.item(), clip_loss.item() if clip_loss else 0,
                                 netpNorm, netgradNorm,
                             ))
 
@@ -971,7 +899,7 @@ def parse_args():
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,
                         help='Number of distributed nodes.')
-    parser.add_argument('--dist_url', default='tcp://127.0.0.1:19991', type=str,
+    parser.add_argument('--dist_url', default='tcp://127.0.0.1:9991', type=str,
                         help='url used to set up distributed training')
     parser.add_argument('--dist_backend', default='nccl', type=str,
                         help='distributed backend')
