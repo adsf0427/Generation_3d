@@ -199,6 +199,7 @@ class PointDiffusionTransformer(nn.Module):
         :return: an [N x C' x T] tensor.
         """
         assert x.shape[-1] == self.n_ctx
+        assert texts==None
         t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
         return self._forward_with_cond(x, [(t_embed, self.time_token_cond)])
 
@@ -211,11 +212,12 @@ class PointDiffusionTransformer(nn.Module):
                 h = h + emb[:, None]
         extra_tokens = [
             (emb[:, None] if len(emb.shape) == 2 else emb)
-            for emb, as_token in cond_as_token
-            if as_token
+            for emb, as_token in cond_as_token if as_token
         ]
         if len(extra_tokens):
             h = torch.cat(extra_tokens + [h], dim=1)
+        
+        # print("debug forward with cond", h.shape)
 
         h = self.ln_pre(h)
         h = self.backbone(h)
@@ -232,7 +234,7 @@ class CLIPImagePointDiffusionTransformer(PointDiffusionTransformer):
         *,
         device: torch.device,
         dtype: torch.dtype,
-        n_ctx: int = 1024,
+        n_ctx: int = 2048,
         token_cond: bool = False,
         cond_drop_prob: float = 0.0,
         frozen_clip: bool = True,
@@ -269,7 +271,9 @@ class CLIPImagePointDiffusionTransformer(PointDiffusionTransformer):
         assert x.shape[-1] == self.n_ctx
 
         t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
+        # print(len(x), len(texts), x.device, self.clip.model.device)
         clip_out = self.clip(batch_size=len(x), images=None, texts=texts, embeddings=None)
+        # print("debug in model", texts[0])
         assert len(clip_out.shape) == 2 and clip_out.shape[0] == x.shape[0]
 
         if self.training:

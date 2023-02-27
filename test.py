@@ -11,10 +11,19 @@ from utils.visualize import *
 from model.transformer_generation import PointDiffusionTransformer, CLIPImagePointDiffusionTransformer
 import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+import clip
+import torch.nn.functional as F
+import yaml
+from model.clip_model import CLIPPC
 
 '''
 some utils
 '''
+
+def disabled_train(self, mode=True):
+    """Overwrite model.train with this function to make sure train/eval mode
+    does not change anymore."""
+    return self
 
 
 def rotation_matrix(axis, theta):
@@ -54,7 +63,7 @@ def norm(v, f):
 def getGradNorm(net):
     pNorm = torch.sqrt(sum(torch.sum(p ** 2) for p in net.parameters()))
     gradNorm = torch.sqrt(sum(torch.sum(p.grad ** 2)
-                          for p in net.parameters()))
+                          for p in net.parameters() if p.grad!=None))
     return pNorm, gradNorm
 
 
@@ -109,7 +118,31 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
 
 
 class GaussianDiffusion:
-    def __init__(self, betas, loss_type, model_mean_type, model_var_type):
+    def __init__(self, betas, loss_type, model_mean_type, model_var_type,
+                 parameterization="eps", clip_ckpt=None):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        config_dir = '/home/internc/CLIP_PC/models/configs/PC.yaml'
+        with open(config_dir) as fin:
+            config = yaml.safe_load(fin)["PC-B"]
+        if clip_ckpt:
+            checkpoint = torch.load(clip_ckpt)
+            state_dict = {}
+            for k, v in checkpoint['state_dict'].items():
+                if k.startswith('model'):
+                    state_dict[k[6:]] = v
+            self.clip_model = CLIPPC(**config)
+            self.clip_model.load_state_dict(state_dict)
+            self.clip_model.to(device)
+            self.clip_model = self.clip_model.eval()
+            self.clip_model.train = disabled_train
+            for param in self.clip_model.parameters():
+                param.requires_grad_(False)
+
+        else :
+            self.clip_model = None
+
+
+        self.parameterization = parameterization
         self.loss_type = loss_type
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -211,7 +244,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, denoise_fn, data, t, texts, clip_denoised: bool, return_pred_xstart: bool):
-
+        print("debug p_mean_variance", texts)
         model_output = denoise_fn(data, t, texts)
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
@@ -230,8 +263,11 @@ class GaussianDiffusion:
             raise NotImplementedError(self.model_var_type)
 
         if self.model_mean_type == 'eps':
-            x_recon = self._predict_xstart_from_eps(
-                data, t=t, eps=model_output)
+            if self.parameterization == "eps":
+                x_recon = self._predict_xstart_from_eps(
+                    data, t=t, eps=model_output)
+            elif self.parameterization == "x0":
+                x_recon = model_output
 
             if clip_denoised:
                 x_recon = torch.clamp(x_recon, -.5, .5)
@@ -276,7 +312,7 @@ class GaussianDiffusion:
         return (sample, pred_xstart) if return_pred_xstart else sample
 
     def p_sample_loop(self, denoise_fn, shape, device,
-                      noise_fn=torch.randn, clip_denoised=True, keep_running=False):
+                      noise_fn=torch.randn, clip_denoised=True, keep_running=False, texts=None):
         """
         Generate samples
         keep_running: True if we run 2 x num_timesteps, False if we just run num_timesteps
@@ -285,7 +321,9 @@ class GaussianDiffusion:
 
         assert isinstance(shape, (tuple, list))
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
-        texts = ['car' for _ in range(shape[0])]
+        if texts == None:
+            texts = ['car' for _ in range(shape[0])]
+        print("p_sample_loop", texts[0])
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64,
                              device=device).fill_(t)
@@ -345,6 +383,10 @@ class GaussianDiffusion:
         """
         B, D, N = data_start.shape
         assert t.shape == torch.Size([B])
+        if self.parameterization == "eps":
+            target = noise
+        elif self.parameterization == "x0":
+            target = data_start
 
         if noise is None:
             noise = torch.randn(
@@ -355,12 +397,29 @@ class GaussianDiffusion:
 
         if self.loss_type == 'mse':
             # predict the noise instead of x_start. seems to be weighted naturally like SNR
-            eps_recon = denoise_fn(data_t, t,  texts=texts)
+            model_out = denoise_fn(data_t, t,  texts=texts)
             assert data_t.shape == data_start.shape
-            assert eps_recon.shape == torch.Size([B, D, N])
-            assert eps_recon.shape == data_start.shape
-            losses = ((noise - eps_recon) **
+            assert model_out.shape == torch.Size([B, D, N])
+            assert model_out.shape == data_start.shape
+            losses = ((target - model_out) **
                       2).mean(dim=list(range(1, len(data_start.shape))))
+            if self.clip_model:
+                assert self.parameterization == "x0"
+                pc_inputs = model_out
+                text_inputs = clip.tokenize(texts).to(device=data_start.device)
+                
+                pc_features = self.clip_model.encode_pc(pc_inputs)
+                text_features = self.clip_model.encode_text(text_inputs)
+
+                pc_features = F.normalize(pc_features, dim=1)           
+                text_features = F.normalize(text_features, dim=1)   
+                image_logits = pc_features @ text_features.t() * self.clip_model.logit_scale.exp()
+                ground_truth = torch.arange(len(image_logits)).long().to(image_logits.device)
+                clip_loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth)).div(2)
+                return losses, clip_loss
+                
+
+
         elif self.loss_type == 'kl':
             losses = self._vb_terms_bpd(
                 denoise_fn=denoise_fn, data_start=data_start, data_t=data_t, t=t, clip_denoised=False,
@@ -369,7 +428,7 @@ class GaussianDiffusion:
             raise NotImplementedError(self.loss_type)
 
         assert losses.shape == torch.Size([B])
-        return losses
+        return losses, None
 
     '''debug'''
 
@@ -423,21 +482,25 @@ class GaussianDiffusion:
 
 
 class ModelTransformer(nn.Module):
-    def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type: str, uncondition: bool = True):
+    def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type: str, parameterization: str, uncondition: bool = True, clip_ckpt: str = None
+                 ):
         super(ModelTransformer, self).__init__()
         self.diffusion = GaussianDiffusion(
-            betas, loss_type, model_mean_type, model_var_type)
+            betas, loss_type, model_mean_type, model_var_type, parameterization=parameterization, clip_ckpt=clip_ckpt)
         self.uncondition = uncondition
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if uncondition:
+            print("uncondition")
             self.model = PointDiffusionTransformer(
                 device=device, dtype=torch.float32, time_token_cond=True
             )
         else :
+            print("condition")
             self.model = CLIPImagePointDiffusionTransformer(
                 device=device, dtype=torch.float32, token_cond=True, time_token_cond=True
             )
+
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -453,7 +516,7 @@ class ModelTransformer(nn.Module):
             'mse_bt': mse_bt
         }
 
-    def _denoise(self, data, t, texts = None):
+    def _denoise(self, data, t, texts):
         B, D, N = data.shape
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
@@ -472,17 +535,18 @@ class ModelTransformer(nn.Module):
             noises[t != 0] = torch.randn(
                 (t != 0).sum(), *noises.shape[1:]).to(noises)
 
-        losses = self.diffusion.p_losses(
+        losses, clip_loss = self.diffusion.p_losses(
             denoise_fn=self._denoise, data_start=data, t=t, noise=noises, texts = texts)
         assert losses.shape == t.shape == torch.Size([B])
-        return losses
+        return losses, clip_loss
 
     def gen_samples(self, shape, device, noise_fn=torch.randn,
                     clip_denoised=True,
-                    keep_running=False):
+                    keep_running=False,
+                    texts=None):
         return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
                                             clip_denoised=clip_denoised,
-                                            keep_running=keep_running)
+                                            keep_running=keep_running, texts=texts)
 
     def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
                         clip_denoised=True, keep_running=False):
@@ -526,70 +590,9 @@ def get_betas(schedule_type, b_start, b_end, time_num):
     return betas
 
 
-def get_dataset(dataroot, npoints, category):
-    tr_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
-                                        categories=[category], split='train',
-                                        tr_sample_size=npoints,
-                                        te_sample_size=npoints,
-                                        scale=1.,
-                                        normalize_per_shape=False,
-                                        normalize_std_per_axis=False,
-                                        random_subsample=True)
-    te_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
-                                        categories=[category], split='val',
-                                        tr_sample_size=npoints,
-                                        te_sample_size=npoints,
-                                        scale=1.,
-                                        normalize_per_shape=False,
-                                        normalize_std_per_axis=False,
-                                        all_points_mean=tr_dataset.all_points_mean,
-                                        all_points_std=tr_dataset.all_points_std,
-                                        )
-    return tr_dataset, te_dataset
-
-
-def get_dataloader(opt, train_dataset, test_dataset=None):
-
-    if opt.distribution_type == 'multi':
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
-            num_replicas=opt.world_size,
-            rank=opt.rank
-        )
-        if test_dataset is not None:
-            test_sampler = torch.utils.data.distributed.DistributedSampler(
-                test_dataset,
-                num_replicas=opt.world_size,
-                rank=opt.rank
-            )
-        else:
-            test_sampler = None
-    else:
-        train_sampler = None
-        test_sampler = None
-
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs, sampler=train_sampler,
-                                                   shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
-
-    if test_dataset is not None:
-        test_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs, sampler=test_sampler,
-                                                      shuffle=False, num_workers=int(opt.workers), drop_last=False)
-    else:
-        test_dataloader = None
-
-    return train_dataloader, test_dataloader, train_sampler, test_sampler
-
-
-def train(gpu, opt, output_dir, noises_init):
+def train(gpu, opt):
 
     set_seed(opt)
-    logger = setup_logging(output_dir)
-    if opt.distribution_type == 'multi':
-        should_diag = gpu == 0
-    else:
-        should_diag = True
-    if should_diag:
-        outf_syn, = setup_output_subdirs(output_dir, 'syn')
 
     if opt.distribution_type == 'multi':
         if opt.dist_url == "env://" and opt.rank == -1:
@@ -607,20 +610,15 @@ def train(gpu, opt, output_dir, noises_init):
         opt.diagIter = int(opt.diagIter / opt.ngpus_per_node)
         opt.vizIter = int(opt.vizIter / opt.ngpus_per_node)
 
-    ''' data '''
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.category)
-    dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
 
-    '''
-    create networks
-    '''
 
     betas = get_betas(opt.schedule_type, opt.beta_start,
                       opt.beta_end, opt.time_num)
-    # model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
+
     if opt.use_transformer:
+        print(opt.uncondition)
         model = ModelTransformer(opt, betas, opt.loss_type,
-                             opt.model_mean_type, opt.model_var_type, uncondition=opt.uncondition)
+                             opt.model_mean_type, opt.model_var_type, parameterization=opt.parameterization ,uncondition=opt.uncondition, clip_ckpt=opt.clip_ckpt)
     else:
         model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
 
@@ -645,179 +643,42 @@ def train(gpu, opt, output_dir, noises_init):
     else:
         raise ValueError('distribution_type = multi | single | None')
 
-    if should_diag:
-        logger.info(opt)
 
-    optimizer = optim.Adam(model.parameters(), lr=opt.lr,
-                           weight_decay=opt.decay, betas=(opt.beta1, 0.999))
-
-    lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, opt.lr_gamma)
 
     if opt.model != '':
         ckpt = torch.load(opt.model)
         model.load_state_dict(ckpt['model_state'])
-        optimizer.load_state_dict(ckpt['optimizer_state'])
 
-    if opt.model != '':
-        start_epoch = torch.load(opt.model)['epoch'] + 1
-    else:
-        start_epoch = 0
 
     def new_x_chain(x, num_chain):
         return torch.randn(num_chain, *x.shape[1:], device=x.device)
 
-    for epoch in range(start_epoch, opt.niter):
 
-        if opt.distribution_type == 'multi':
-            train_sampler.set_epoch(epoch)
+    model.eval()
+    with torch.no_grad():
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        x = torch.rand(25, 3, 2048, device=device)
+        cat = 'keyboard'
+        texts = [cat for _ in range(x.shape[0])]
+        print(texts)
 
-        lr_scheduler.step(epoch)
+        x_gen_eval = model.gen_samples(new_x_chain(
+            x, 5).shape, x.device, clip_denoised=False, texts=texts)
 
-        for i, data in enumerate(dataloader):
-            x = data['train_points'].transpose(1, 2)
-            texts = data['text']
-            noises_batch = noises_init[data['idx']].transpose(1, 2)
 
-            '''
-            train diffusion
-            '''
+    visualize_pointcloud_batch('./output/test/%s.png' % cat,
+                                x_gen_eval.transpose(1, 2), None, None,
+                                None)
 
-            if opt.distribution_type == 'multi' or (opt.distribution_type is None and gpu is not None):
-                x = x.cuda(gpu)
-                noises_batch = noises_batch.cuda(gpu)
-            elif opt.distribution_type == 'single':
-                x = x.cuda()
-                noises_batch = noises_batch.cuda()
-
-            loss = model.get_loss_iter(x, noises_batch, texts = texts).mean()
-
-            optimizer.zero_grad()
-            loss.backward()
-            netpNorm, netgradNorm = getGradNorm(model)
-            if opt.grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), opt.grad_clip)
-
-            optimizer.step()
-
-            if i % opt.print_freq == 0 and should_diag:
-                # print(x.shape, noises_batch.shape)
-
-                logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    loss: {:>10.4f},    '
-                            'netpNorm: {:>10.2f},   netgradNorm: {:>10.2f}     '
-                            .format(
-                                epoch, opt.niter, i, len(
-                                    dataloader), loss.item(),
-                                netpNorm, netgradNorm,
-                            ))
-
-        if (epoch) % opt.diagIter == 0 and should_diag:
-
-            logger.info('Diagnosis:')
-
-            x_range = [x.min().item(), x.max().item()]
-            kl_stats = model.all_kl(x)
-            logger.info('      [{:>3d}/{:>3d}]    '
-                        'x_range: [{:>10.4f}, {:>10.4f}],   '
-                        'total_bpd_b: {:>10.4f},    '
-                        'terms_bpd: {:>10.4f},  '
-                        'prior_bpd_b: {:>10.4f}    '
-                        'mse_bt: {:>10.4f}  '
-                        .format(
-                            epoch, opt.niter,
-                            *x_range,
-                            kl_stats['total_bpd_b'].item(),
-                            kl_stats['terms_bpd'].item(), kl_stats['prior_bpd_b'].item(
-                            ), kl_stats['mse_bt'].item()
-                        ))
-
-        if (epoch) % opt.vizIter == 0 and should_diag:
-            logger.info('Generation: eval')
-
-            model.eval()
-            with torch.no_grad():
-
-                x_gen_eval = model.gen_samples(new_x_chain(
-                    x, 25).shape, x.device, clip_denoised=False)
-                x_gen_list = model.gen_sample_traj(new_x_chain(
-                    x, 1).shape, x.device, freq=40, clip_denoised=False)
-                x_gen_all = torch.cat(x_gen_list, dim=0)
-
-                gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
-                gen_eval_range = [
-                    x_gen_eval.min().item(), x_gen_eval.max().item()]
-
-                logger.info('      [{:>3d}/{:>3d}]  '
-                            'eval_gen_range: [{:>10.4f}, {:>10.4f}]     '
-                            'eval_gen_stats: [mean={:>10.4f}, std={:>10.4f}]      '
-                            .format(
-                                epoch, opt.niter,
-                                *gen_eval_range, *gen_stats,
-                            ))
-
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval.png' % (outf_syn, epoch),
-                                       x_gen_eval.transpose(1, 2), None, None,
-                                       None)
-
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_all.png' % (outf_syn, epoch),
-                                       x_gen_all.transpose(1, 2), None,
-                                       None,
-                                       None)
-
-            visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x.transpose(1, 2), None,
-                                       None,
-                                       None)
-
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_all_color.png' % (outf_syn, epoch),
-                                       x_gen_all.transpose(1, 2), None,
-                                       None,
-                                       None,
-                                       rand_col=True)
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_color.png' % (outf_syn, epoch),
-                                       x_gen_eval.transpose(1, 2), None,
-                                       None,
-                                       None,
-                                       rand_col=True)
-
-            logger.info('Generation: train')
-            model.train()
-
-        if (epoch) % opt.saveIter == 0:
-
-            if should_diag:
-
-                save_dict = {
-                    'epoch': epoch,
-                    'model_state': model.state_dict(),
-                    'optimizer_state': optimizer.state_dict()
-                }
-
-                torch.save(save_dict, '%s/epoch_%d.pth' % (output_dir, epoch))
-
-            if opt.distribution_type == 'multi':
-                dist.barrier()
-                map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
-                model.load_state_dict(
-                    torch.load('%s/epoch_%d.pth' % (output_dir, epoch), map_location=map_location)['model_state'])
-
-    dist.destroy_process_group()
+    # dist.destroy_process_group()
 
 
 def main():
     opt = parse_args()
-    if opt.category == 'airplane':
-        opt.beta_start = 1e-5
-        opt.beta_end = 0.008
-        opt.schedule_type = 'warm0.1'
-
-    exp_id = os.path.splitext(os.path.basename(__file__))[0]
-    dir_id = os.path.dirname(__file__)
-    output_dir = get_output_dir(dir_id, exp_id)
-    copy_source(__file__, output_dir)
 
     ''' workaround '''
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.category)
-    noises_init = torch.randn(len(train_dataset), opt.npoints, opt.nc)
+
+
 
     if opt.dist_url == "env://" and opt.world_size == -1:
         opt.world_size = int(os.environ["WORLD_SIZE"])
@@ -826,18 +687,14 @@ def main():
         opt.ngpus_per_node = torch.cuda.device_count()
         opt.world_size = opt.ngpus_per_node * opt.world_size
         mp.spawn(train, nprocs=opt.ngpus_per_node,
-                 args=(opt, output_dir, noises_init))
+                 args=(opt))
     else:
-        train(opt.gpu, opt, output_dir, noises_init)
+        train(opt.gpu, opt)
 
 
 def parse_args():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
-    parser.add_argument('--category', default='chair')
-
-    parser.add_argument('--bs', type=int, default=16, help='input batch size')
     parser.add_argument('--workers', type=int, default=16, help='workers')
     parser.add_argument('--niter', type=int, default=10000,
                         help='number of epochs to train for')
@@ -851,8 +708,11 @@ def parse_args():
     parser.add_argument('--time_num', default=1000)
 
     # params
-    parser.add_argument('--uncondition', default=True)
-    parser.add_argument('--use_transformer', default=True)
+    parser.add_argument('--uncondition', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--use_transformer', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--clip_ckpt', default=None)
+    parser.add_argument('--parameterization', default='eps')
+    
 
     parser.add_argument('--attention', default=True)
     parser.add_argument('--dropout', default=0.1)
@@ -878,11 +738,11 @@ def parse_args():
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,
                         help='Number of distributed nodes.')
-    parser.add_argument('--dist_url', default='tcp://127.0.0.1:9991', type=str,
+    parser.add_argument('--dist_url', default='tcp://127.0.0.1:19991', type=str,
                         help='url used to set up distributed training')
     parser.add_argument('--dist_backend', default='nccl', type=str,
                         help='distributed backend')
-    parser.add_argument('--distribution_type', default='single', choices=['multi', 'single', None],
+    parser.add_argument('--distribution_type', default='single' , choices=['multi', 'single', None],
                         help='Use multi-processing distributed training to launch '
                              'N processes per node, which has N GPUs. This is the '
                              'fastest way to use PyTorch for either single node or '

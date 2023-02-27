@@ -4,8 +4,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
+from functools import lru_cache
+import os
 
-# from .download import default_cache_dir
+@lru_cache()
+def default_cache_dir() -> str:
+    return os.path.join(os.path.abspath(os.getcwd()), "model_cache")
 
 ImageType = Union[np.ndarray, torch.Tensor, Image.Image]
 

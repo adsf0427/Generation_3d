@@ -11,10 +11,19 @@ from utils.visualize import *
 from model.transformer_generation import PointDiffusionTransformer, CLIPImagePointDiffusionTransformer
 import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+import clip
+import torch.nn.functional as F
+import yaml
+from model.clip_model import CLIPPC
 
 '''
 some utils
 '''
+
+def disabled_train(self, mode=True):
+    """Overwrite model.train with this function to make sure train/eval mode
+    does not change anymore."""
+    return self
 
 
 def rotation_matrix(axis, theta):
@@ -54,7 +63,7 @@ def norm(v, f):
 def getGradNorm(net):
     pNorm = torch.sqrt(sum(torch.sum(p ** 2) for p in net.parameters()))
     gradNorm = torch.sqrt(sum(torch.sum(p.grad ** 2)
-                          for p in net.parameters()))
+                          for p in net.parameters() if p.grad!=None))
     return pNorm, gradNorm
 
 
@@ -110,7 +119,29 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
 
 class GaussianDiffusion:
     def __init__(self, betas, loss_type, model_mean_type, model_var_type,
-                 parameterization="eps", clip_model=None):
+                 parameterization="eps", clip_ckpt=None):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        config_dir = '/home/internc/CLIP_PC/models/configs/PC.yaml'
+        with open(config_dir) as fin:
+            config = yaml.safe_load(fin)["PC-B"]
+        if clip_ckpt:
+            checkpoint = torch.load(clip_ckpt)
+            state_dict = {}
+            for k, v in checkpoint['state_dict'].items():
+                if k.startswith('model'):
+                    state_dict[k[6:]] = v
+            self.clip_model = CLIPPC(**config)
+            self.clip_model.load_state_dict(state_dict)
+            self.clip_model.to(device)
+            self.clip_model = self.clip_model.eval()
+            self.clip_model.train = disabled_train
+            for param in self.clip_model.parameters():
+                param.requires_grad_(False)
+
+        else :
+            self.clip_model = None
+
+
         self.parameterization = parameterization
         self.loss_type = loss_type
         self.model_mean_type = model_mean_type
@@ -370,8 +401,20 @@ class GaussianDiffusion:
             assert model_out.shape == data_start.shape
             losses = ((target - model_out) **
                       2).mean(dim=list(range(1, len(data_start.shape))))
-            if self.clip_loss:
+            if self.clip_model:
                 assert self.parameterization == "x0"
+                pc_inputs = model_out
+                text_inputs = clip.tokenize(texts).to(device=data_start.device)
+                
+                pc_features = self.clip_model.encode_pc(pc_inputs)
+                text_features = self.clip_model.encode_text(text_inputs)
+
+                pc_features = F.normalize(pc_features, dim=1)           
+                text_features = F.normalize(text_features, dim=1)   
+                image_logits = pc_features @ text_features.t() * self.clip_model.logit_scale.exp()
+                ground_truth = torch.arange(len(image_logits)).long().to(image_logits.device)
+                clip_loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth)).div(2)
+                return losses, clip_loss
                 
 
 
@@ -383,7 +426,7 @@ class GaussianDiffusion:
             raise NotImplementedError(self.loss_type)
 
         assert losses.shape == torch.Size([B])
-        return losses
+        return losses, None
 
     '''debug'''
 
@@ -437,13 +480,14 @@ class GaussianDiffusion:
 
 
 class ModelTransformer(nn.Module):
-    def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type: str, uncondition: bool = True):
+    def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type: str, parameterization: str, device: torch.device, uncondition: bool = False, clip_ckpt: str = None
+                 ):
         super(ModelTransformer, self).__init__()
+        self.device = device
         self.diffusion = GaussianDiffusion(
-            betas, loss_type, model_mean_type, model_var_type)
+            betas, loss_type, model_mean_type, model_var_type, parameterization=parameterization, clip_ckpt=clip_ckpt)
         self.uncondition = uncondition
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if uncondition:
             self.model = PointDiffusionTransformer(
                 device=device, dtype=torch.float32, time_token_cond=True
@@ -452,6 +496,7 @@ class ModelTransformer(nn.Module):
             self.model = CLIPImagePointDiffusionTransformer(
                 device=device, dtype=torch.float32, token_cond=True, time_token_cond=True
             )
+
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -477,7 +522,7 @@ class ModelTransformer(nn.Module):
         assert out.shape == torch.Size([B, D, N])
         return out
 
-    def get_loss_iter(self, data, noises=None, texts = None, clip_loss=False):
+    def get_loss_iter(self, data, noises=None, texts = None):
         B, D, N = data.shape
         t = torch.randint(0, self.diffusion.num_timesteps,
                           size=(B,), device=data.device)
@@ -486,10 +531,10 @@ class ModelTransformer(nn.Module):
             noises[t != 0] = torch.randn(
                 (t != 0).sum(), *noises.shape[1:]).to(noises)
 
-        losses = self.diffusion.p_losses(
+        losses, clip_loss = self.diffusion.p_losses(
             denoise_fn=self._denoise, data_start=data, t=t, noise=noises, texts = texts)
         assert losses.shape == t.shape == torch.Size([B])
-        return losses
+        return losses, clip_loss
 
     def gen_samples(self, shape, device, noise_fn=torch.randn,
                     clip_denoised=True,
@@ -634,7 +679,7 @@ def train(gpu, opt, output_dir, noises_init):
     # model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
     if opt.use_transformer:
         model = ModelTransformer(opt, betas, opt.loss_type,
-                             opt.model_mean_type, opt.model_var_type, uncondition=opt.uncondition)
+                             opt.model_mean_type, opt.model_var_type, device=gpu, parameterization=opt.parameterization ,uncondition=opt.uncondition, clip_ckpt=opt.clip_ckpt)
     else:
         model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
 
@@ -702,12 +747,11 @@ def train(gpu, opt, output_dir, noises_init):
             elif opt.distribution_type == 'single':
                 x = x.cuda()
                 noises_batch = noises_batch.cuda()
-
+            # print("texts shape", len(texts), x.shape)
             diff_loss, clip_loss = model.get_loss_iter(x, noises_batch, texts = texts)
             diff_loss = diff_loss.mean()
 
             if clip_loss:
-                clip_loss = clip_loss.mean()
                 loss = diff_loss + clip_loss
             else :
                 loss = diff_loss
@@ -872,8 +916,11 @@ def parse_args():
     parser.add_argument('--time_num', default=1000)
 
     # params
-    parser.add_argument('--uncondition', default=True)
-    parser.add_argument('--use_transformer', default=True)
+    parser.add_argument('--uncondition', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--use_transformer', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--clip_ckpt', default=None)
+    parser.add_argument('--parameterization', default='eps')
+    
 
     parser.add_argument('--attention', default=True)
     parser.add_argument('--dropout', default=0.1)
@@ -899,7 +946,7 @@ def parse_args():
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,
                         help='Number of distributed nodes.')
-    parser.add_argument('--dist_url', default='tcp://127.0.0.1:9991', type=str,
+    parser.add_argument('--dist_url', default='tcp://127.0.0.1:19991', type=str,
                         help='url used to set up distributed training')
     parser.add_argument('--dist_backend', default='nccl', type=str,
                         help='distributed backend')
@@ -914,9 +961,9 @@ def parse_args():
                         help='GPU id to use. None means using all available GPUs.')
 
     '''eval'''
-    parser.add_argument('--saveIter', default=20, help='unit: epoch')
-    parser.add_argument('--diagIter', default=20, help='unit: epoch')
-    parser.add_argument('--vizIter', default=20, help='unit: epoch')
+    parser.add_argument('--saveIter', default=160, help='unit: epoch')
+    parser.add_argument('--diagIter', default=160, help='unit: epoch')
+    parser.add_argument('--vizIter', default=160, help='unit: epoch')
     parser.add_argument('--print_freq', default=20, help='unit: iter')
 
     parser.add_argument('--manualSeed', default=42,
