@@ -331,8 +331,9 @@ class GaussianDiffusion:
     def _vb_terms_bpd(self, denoise_fn, data_start, data_t, t, clip_denoised: bool, return_pred_xstart: bool):
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
             x_start=data_start, x_t=data_t, t=t)
+        texts = ['car' for _ in range(data_t.shape[0])]
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
-            denoise_fn, data=data_t, t=t, clip_denoised=clip_denoised, return_pred_xstart=True)
+            denoise_fn, data=data_t, t=t, texts=texts, clip_denoised=clip_denoised, return_pred_xstart=True)
         kl = normal_kl(true_mean, true_log_variance_clipped,
                        model_mean, model_log_variance)
         kl = kl.mean(dim=list(range(1, len(data_start.shape)))) / np.log(2.)
@@ -970,7 +971,7 @@ def parse_args():
     '''distributed'''
     parser.add_argument('--world_size', default=1, type=int,
                         help='Number of distributed nodes.')
-    parser.add_argument('--dist_url', default='tcp://127.0.0.1:9991', type=str,
+    parser.add_argument('--dist_url', default='tcp://127.0.0.1:19991', type=str,
                         help='url used to set up distributed training')
     parser.add_argument('--dist_backend', default='nccl', type=str,
                         help='distributed backend')
