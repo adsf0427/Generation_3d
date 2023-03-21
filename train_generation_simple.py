@@ -713,8 +713,10 @@ def train(gpu, opt, output_dir, noises_init):
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, opt.lr_gamma)
 
     if opt.model != '':
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
         ckpt = torch.load(opt.model)
-        model.load_state_dict(ckpt['model_state'])
+        
+        model.load_state_dict(ckpt['model_state'],  map_location=map_location)
         optimizer.load_state_dict(ckpt['optimizer_state'])
 
     if opt.model != '':

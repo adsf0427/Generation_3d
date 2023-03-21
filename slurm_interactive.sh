@@ -30,12 +30,13 @@ OMP_NUM_THREADS=16
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python train_generation_simple.py --category all --no-uncondition --bs 64 --use_transformer --dataroot "../ShapeNetCore.v2.PC15k/" \
 --parameterization "eps" \
+--model "output/train_generation_simple/2023-02-27-22-27-51/epoch_240.pth" \
 --distribution_type multi
 
 CUDA_VISIBLE_DEVICES=7 \
-python test.py --uncondition False \
---parameterization "eps" \
---model "output/train_generation_simple/2023-02-21-22-57-02/epoch_250.pth"
+python test.py --no-uncondition --use_transformer \
+--parameterization "eps" --manualSeed 360 \
+--model "output/train_generation_simple/2023-03-06-14-37-18/epoch_500.pth"
 
 export NCCL_BLOCKING_WAIT=1
 

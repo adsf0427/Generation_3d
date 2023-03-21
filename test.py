@@ -244,7 +244,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, denoise_fn, data, t, texts, clip_denoised: bool, return_pred_xstart: bool):
-        print("debug p_mean_variance", texts)
+        # print("debug p_mean_variance", texts)
         model_output = denoise_fn(data, t, texts)
 
         if self.model_var_type in ['fixedsmall', 'fixedlarge']:
@@ -323,7 +323,7 @@ class GaussianDiffusion:
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
         if texts == None:
             texts = ['car' for _ in range(shape[0])]
-        print("p_sample_loop", texts[0])
+        # print("p_sample_loop", texts[0])
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64,
                              device=device).fill_(t)
@@ -658,14 +658,14 @@ def train(gpu, opt):
     with torch.no_grad():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         x = torch.rand(25, 3, 2048, device=device)
-        cat = 'keyboard'
+        cat = 'a model of airplane'
         texts = [cat for _ in range(x.shape[0])]
         print(texts)
 
         x_gen_eval = model.gen_samples(new_x_chain(
-            x, 5).shape, x.device, clip_denoised=False, texts=texts)
+            x, x.shape[0]).shape, x.device, clip_denoised=False, texts=texts)
 
-
+    # x_gen_eval = x_gen_eval.repeat(5,1,1)
     visualize_pointcloud_batch('./output/test/%s.png' % cat,
                                 x_gen_eval.transpose(1, 2), None, None,
                                 None)
